@@ -294,6 +294,7 @@ fn fourcc_to_pixel_format(fourcc: &FourCC) -> PixelFormat {
         b"MJPG" | b"JPEG" => PixelFormat::Mjpeg,
         b"YUYV" | b"YUY2" => PixelFormat::Yuyv,
         b"NV12" => PixelFormat::Nv12,
+        b"GREY" | b"Y800" | b"Y8  " => PixelFormat::Gray8,
         b"RGB3" | b"RGB\0" => PixelFormat::Rgb8,
         b"BGR3" => PixelFormat::Bgra8,
         b"AB24" | b"RGBA" => PixelFormat::Rgba8,
@@ -310,6 +311,7 @@ fn pixel_format_to_fourcc(format: PixelFormat) -> FourCC {
         PixelFormat::Rgb8 => FourCC::new(b"RGB3"),
         PixelFormat::Rgba8 => FourCC::new(b"AB24"),
         PixelFormat::Bgra8 => FourCC::new(b"BA24"),
+        PixelFormat::Gray8 => FourCC::new(b"GREY"),
     }
 }
 

@@ -28,12 +28,13 @@ pub fn to_rgb8(frame: &Frame) -> Result<Vec<u8>, Error> {
             stride,
         )),
         PixelFormat::Mjpeg => mjpeg_to_rgb(&frame.plane_primary),
+        PixelFormat::Gray8 => Ok(gray_to_rgb(&frame.plane_primary, width, height, stride)),
     }
 }
 
 /// Convert a frame to packed 32-bit RGBA (4 bytes per pixel).
 ///
-/// For formats without an alpha channel (RGB8, YUYV, NV12, MJPEG), the alpha byte is
+/// For formats without an alpha channel (RGB8, YUYV, NV12, MJPEG, Gray8), the alpha byte is
 /// filled with 0xFF. For BGRA8, the channel order is swapped in place.
 pub fn to_rgba8(frame: &Frame) -> Result<Vec<u8>, Error> {
     let width = frame.width as usize;
@@ -42,6 +43,7 @@ pub fn to_rgba8(frame: &Frame) -> Result<Vec<u8>, Error> {
     match frame.pixel_format {
         PixelFormat::Rgba8 => Ok(frame.plane_primary.to_vec()),
         PixelFormat::Bgra8 => Ok(bgra_to_rgba(&frame.plane_primary, width, height, stride)),
+        PixelFormat::Gray8 => Ok(gray_to_rgba(&frame.plane_primary, width, height, stride)),
         _ => {
             let rgb = to_rgb8(frame)?;
             Ok(rgb_to_rgba(&rgb))
@@ -96,6 +98,48 @@ fn bgra_to_rgba(data: &[u8], width: usize, height: usize, stride: usize) -> Vec<
             // alpha byte set to 0 (XRGB semantics), which makes the frame
             // render fully transparent in consumers that respect alpha.
             output.push(0xFF);
+        }
+    }
+    output
+}
+
+/// Iterate the visible `width` bytes of each row of a single-channel 8-bit image,
+/// honoring stride and tolerating a short buffer.
+fn gray_rows(
+    data: &[u8],
+    width: usize,
+    height: usize,
+    stride: usize,
+) -> impl Iterator<Item = &[u8]> {
+    let effective_stride = if stride == 0 {
+        width
+    } else {
+        stride.max(width)
+    };
+    let rows_available = data.len().checked_div(effective_stride).unwrap_or(0);
+    let rows = height.min(rows_available);
+    (0..rows).map(move |row| {
+        let offset = row * effective_stride;
+        let end = offset.saturating_add(width).min(data.len());
+        &data[offset..end]
+    })
+}
+
+fn gray_to_rgb(data: &[u8], width: usize, height: usize, stride: usize) -> Vec<u8> {
+    let mut output = Vec::with_capacity(width * height * 3);
+    for row in gray_rows(data, width, height, stride) {
+        for &luma in row {
+            output.extend_from_slice(&[luma, luma, luma]);
+        }
+    }
+    output
+}
+
+fn gray_to_rgba(data: &[u8], width: usize, height: usize, stride: usize) -> Vec<u8> {
+    let mut output = Vec::with_capacity(width * height * 4);
+    for row in gray_rows(data, width, height, stride) {
+        for &luma in row {
+            output.extend_from_slice(&[luma, luma, luma, 0xFF]);
         }
     }
     output
@@ -194,6 +238,10 @@ pub(crate) fn to_luma8(frame: &Frame) -> Vec<u8> {
         PixelFormat::Bgra8 => bgra_to_luma(&frame.plane_primary, width, height, stride),
         PixelFormat::Yuyv => yuyv_to_luma(&frame.plane_primary, width, height, stride),
         PixelFormat::Nv12 => nv12_y_to_luma(&frame.plane_primary, width, height, stride),
+        PixelFormat::Gray8 => gray_rows(&frame.plane_primary, width, height, stride)
+            .flatten()
+            .copied()
+            .collect(),
         PixelFormat::Mjpeg => mjpeg_to_rgb(&frame.plane_primary)
             .map(|rgb| rgb_to_luma(&rgb))
             .unwrap_or_default(),
@@ -282,4 +330,52 @@ fn nv12_y_to_luma(y_plane: &[u8], width: usize, height: usize, stride: usize) ->
         output.extend_from_slice(&y_plane[start..end]);
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::FrameQuality;
+    use bytes::Bytes;
+    use std::time::Duration;
+
+    fn gray_frame(data: Vec<u8>, width: u32, height: u32, stride: u32) -> Frame {
+        Frame {
+            width,
+            height,
+            stride,
+            timestamp: Duration::ZERO,
+            pixel_format: PixelFormat::Gray8,
+            quality: FrameQuality::Intact,
+            plane_primary: Bytes::from(data),
+            plane_secondary: Bytes::new(),
+        }
+    }
+
+    #[test]
+    fn gray8_to_rgb8_replicates_luma() {
+        let frame = gray_frame(vec![0, 128, 255, 7], 2, 2, 2);
+        let rgb = to_rgb8(&frame).unwrap();
+        assert_eq!(rgb, vec![0, 0, 0, 128, 128, 128, 255, 255, 255, 7, 7, 7]);
+    }
+
+    #[test]
+    fn gray8_to_rgba8_honors_stride() {
+        // 2x2 image with 4-byte stride (2 bytes padding per row).
+        let frame = gray_frame(vec![10, 20, 99, 99, 30, 40, 99, 99], 2, 2, 4);
+        let rgba = to_rgba8(&frame).unwrap();
+        assert_eq!(
+            rgba,
+            vec![
+                10, 10, 10, 255, 20, 20, 20, 255, 30, 30, 30, 255, 40, 40, 40, 255
+            ]
+        );
+    }
+
+    #[cfg(feature = "analysis")]
+    #[test]
+    fn gray8_to_luma_strips_padding() {
+        let frame = gray_frame(vec![1, 2, 0, 3, 4, 0], 2, 2, 3);
+        assert_eq!(to_luma8(&frame), vec![1, 2, 3, 4]);
+    }
 }

@@ -384,49 +384,47 @@ fn configure_reader(
     reader: &IMFSourceReader,
     config: &StreamConfig,
 ) -> Result<(u32, StreamConfig), Error> {
-    let target_subtype = pixel_format_to_guid(config.pixel_format);
-
     let (stream, native) = find_video_stream(reader, &config.resolution)?;
     let framerate = native.framerate.max(1);
 
-    let output_type = unsafe { MFCreateMediaType() }.map_err(map_com_error)?;
-    unsafe {
-        output_type
-            .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
-            .map_err(map_com_error)?;
-        output_type
-            .SetGUID(&MF_MT_SUBTYPE, &target_subtype)
-            .map_err(map_com_error)?;
-        output_type
-            .SetUINT64(
-                &MF_MT_FRAME_SIZE,
-                pack_u32_pair(native.resolution.width, native.resolution.height),
-            )
-            .map_err(map_com_error)?;
-        output_type
-            .SetUINT64(&MF_MT_FRAME_RATE, pack_u32_pair(framerate, 1))
-            .map_err(map_com_error)?;
-        output_type
-            .SetUINT32(&MF_MT_INTERLACE_MODE, 2)
-            .map_err(map_com_error)?;
-        output_type
-            .SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)
-            .map_err(map_com_error)?;
-    }
+    // Monochrome cameras expose one of several grayscale subtypes (L8, Y800, Y8, GREY).
+    // Media Foundation will not translate between them, so ask for the exact one the
+    // device advertises.
+    let native_gray = find_native_gray_subtype(reader, stream, &native.resolution);
 
-    unsafe {
-        reader
-            .SetCurrentMediaType(stream, None, &output_type)
-            .map_err(|error| Error::Backend {
-                platform: "windows",
-                message: format!(
-                    "SetCurrentMediaType failed for {:?} at {}x{}: {}",
-                    config.pixel_format,
-                    native.resolution.width,
-                    native.resolution.height,
-                    error.message(),
-                ),
-            })?;
+    let mut pixel_format = config.pixel_format;
+    let target_subtype = if pixel_format == PixelFormat::Gray8 {
+        native_gray.unwrap_or(MF_VIDEO_FORMAT_L8)
+    } else {
+        pixel_format_to_guid(pixel_format)
+    };
+
+    if let Err(error) = set_output_type(
+        reader,
+        stream,
+        &native,
+        framerate,
+        pixel_format,
+        &target_subtype,
+    ) {
+        // The video processor cannot convert grayscale input to colour output, so a
+        // gray-only camera opened with e.g. Bgra8 would otherwise fail. Fall back to
+        // delivering native Gray8 frames; the applied config reports Gray8 and
+        // `to_rgb8` / `to_rgba8` still work on them.
+        match native_gray {
+            Some(gray_subtype) if pixel_format != PixelFormat::Gray8 => {
+                set_output_type(
+                    reader,
+                    stream,
+                    &native,
+                    framerate,
+                    PixelFormat::Gray8,
+                    &gray_subtype,
+                )?;
+                pixel_format = PixelFormat::Gray8;
+            }
+            _ => return Err(error),
+        }
     }
 
     unsafe {
@@ -457,9 +455,85 @@ fn configure_reader(
                 height: applied_height,
             },
             framerate: applied_framerate.max(1),
-            pixel_format: config.pixel_format,
+            pixel_format,
         },
     ))
+}
+
+fn set_output_type(
+    reader: &IMFSourceReader,
+    stream: u32,
+    native: &NativeMatch,
+    framerate: u32,
+    pixel_format: PixelFormat,
+    subtype: &GUID,
+) -> Result<(), Error> {
+    let output_type = unsafe { MFCreateMediaType() }.map_err(map_com_error)?;
+    unsafe {
+        output_type
+            .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
+            .map_err(map_com_error)?;
+        output_type
+            .SetGUID(&MF_MT_SUBTYPE, subtype)
+            .map_err(map_com_error)?;
+        output_type
+            .SetUINT64(
+                &MF_MT_FRAME_SIZE,
+                pack_u32_pair(native.resolution.width, native.resolution.height),
+            )
+            .map_err(map_com_error)?;
+        output_type
+            .SetUINT64(&MF_MT_FRAME_RATE, pack_u32_pair(framerate, 1))
+            .map_err(map_com_error)?;
+        output_type
+            .SetUINT32(&MF_MT_INTERLACE_MODE, 2)
+            .map_err(map_com_error)?;
+        output_type
+            .SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)
+            .map_err(map_com_error)?;
+    }
+
+    unsafe {
+        reader
+            .SetCurrentMediaType(stream, None, &output_type)
+            .map_err(|error| Error::Backend {
+                platform: "windows",
+                message: format!(
+                    "SetCurrentMediaType failed for {:?} at {}x{}: {}",
+                    pixel_format,
+                    native.resolution.width,
+                    native.resolution.height,
+                    error.message(),
+                ),
+            })
+    }
+}
+
+/// Returns the grayscale subtype the device natively offers on `stream`, preferring one
+/// whose frame size matches `resolution`.
+fn find_native_gray_subtype(
+    reader: &IMFSourceReader,
+    stream: u32,
+    resolution: &Resolution,
+) -> Option<GUID> {
+    let mut any_size: Option<GUID> = None;
+    let mut type_index: u32 = 0;
+    while let Ok(media_type) = unsafe { reader.GetNativeMediaType(stream, type_index) } {
+        type_index += 1;
+        let Ok(subtype) = (unsafe { media_type.GetGUID(&MF_MT_SUBTYPE) }) else {
+            continue;
+        };
+        if !is_gray_subtype(&subtype) {
+            continue;
+        }
+        if let Ok((width, height)) = read_packed_u64(&media_type, &MF_MT_FRAME_SIZE) {
+            if width == resolution.width && height == resolution.height {
+                return Some(subtype);
+            }
+        }
+        any_size.get_or_insert(subtype);
+    }
+    any_size
 }
 
 fn find_video_stream(
@@ -601,7 +675,7 @@ fn expected_stride_bytes(pixel_format: PixelFormat, width: u32) -> u32 {
         PixelFormat::Bgra8 | PixelFormat::Rgba8 => width * 4,
         PixelFormat::Rgb8 => width * 3,
         PixelFormat::Yuyv => width * 2,
-        PixelFormat::Nv12 => width,
+        PixelFormat::Nv12 | PixelFormat::Gray8 => width,
         PixelFormat::Mjpeg => 0,
     }
 }
@@ -727,6 +801,8 @@ fn guid_to_pixel_format(guid: &GUID) -> PixelFormat {
         PixelFormat::Nv12
     } else if *guid == MFVideoFormat_YUY2 {
         PixelFormat::Yuyv
+    } else if is_gray_subtype(guid) {
+        PixelFormat::Gray8
     } else {
         PixelFormat::Mjpeg
     }
@@ -740,7 +816,39 @@ fn pixel_format_to_guid(format: PixelFormat) -> GUID {
         PixelFormat::Yuyv => MFVideoFormat_YUY2,
         PixelFormat::Mjpeg => MFVideoFormat_MJPG,
         PixelFormat::Rgb8 => MFVideoFormat_RGB24,
+        PixelFormat::Gray8 => MF_VIDEO_FORMAT_L8,
     }
+}
+
+/// Builds a Media Foundation subtype GUID from a FourCC / D3DFORMAT code
+/// (`XXXXXXXX-0000-0010-8000-00AA00389B71`).
+const fn fourcc_subtype(code: u32) -> GUID {
+    GUID::from_values(
+        code,
+        0x0000,
+        0x0010,
+        [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71],
+    )
+}
+
+const fn fourcc(bytes: &[u8; 4]) -> u32 {
+    u32::from_le_bytes(*bytes)
+}
+
+/// `MFVideoFormat_L8` (D3DFMT_L8 = 50): 8-bit luminance.
+const MF_VIDEO_FORMAT_L8: GUID = fourcc_subtype(50);
+/// `MEDIASUBTYPE_Y800` / `MFVideoFormat_Y800`: 8-bit grayscale.
+const MF_VIDEO_FORMAT_Y800: GUID = fourcc_subtype(fourcc(b"Y800"));
+/// `Y8  `: alias of Y800 used by some drivers.
+const MF_VIDEO_FORMAT_Y8: GUID = fourcc_subtype(fourcc(b"Y8  "));
+/// `GREY`: alias of Y800 used by some drivers.
+const MF_VIDEO_FORMAT_GREY: GUID = fourcc_subtype(fourcc(b"GREY"));
+
+fn is_gray_subtype(guid: &GUID) -> bool {
+    *guid == MF_VIDEO_FORMAT_L8
+        || *guid == MF_VIDEO_FORMAT_Y800
+        || *guid == MF_VIDEO_FORMAT_Y8
+        || *guid == MF_VIDEO_FORMAT_GREY
 }
 
 impl PixelFormat {

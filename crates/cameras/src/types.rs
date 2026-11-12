@@ -93,6 +93,11 @@ pub enum PixelFormat {
     Nv12,
     /// Compressed Motion JPEG. Decodable via [`crate::to_rgb8`] (which uses `zune-jpeg`).
     Mjpeg,
+    /// 8-bit single-channel grayscale (luma only), one plane, 1 byte per pixel.
+    ///
+    /// Delivered by monochrome cameras (DirectShow `gray`, Media Foundation `L8` / `Y800`,
+    /// V4L2 `GREY`).
+    Gray8,
 }
 
 /// A closed range of framerates a device format can produce, in frames per second.
